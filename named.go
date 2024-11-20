@@ -14,12 +14,13 @@ package sqlx
 import (
 	"bytes"
 	"database/sql"
-	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
 	"strconv"
+	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/jmoiron/sqlx/reflectx"
 )
@@ -319,90 +320,171 @@ func bindMap(bindType int, query string, args map[string]interface{}) (string, [
 // digits and numbers, where '5' is a digit but '五' is not.
 var allowedBindRunes = []*unicode.RangeTable{unicode.Letter, unicode.Digit}
 
-// FIXME: this function isn't safe for unicode named params, as a failing test
-// can testify.  This is not a regression but a failure of the original code
-// as well.  It should be modified to range over runes in a string rather than
-// bytes, even though this is less convenient and slower.  Hopefully the
-// addition of the prepared NamedStmt (which will only do this once) will make
-// up for the slightly slower ad-hoc NamedExec/NamedQuery.
+type parseNamedState int
+
+const (
+	parseStateConsumingIdent parseNamedState = iota
+	parseStateQuery
+	parseStateQuotedIdent
+	parseStateStringConstant
+	parseStateLineComment
+	parseStateBlockComment
+	parseStateSkipThenTransition
+	parseStateDollarQuoteLiteral
+)
+
+type parseNamedContext struct {
+	state parseNamedState
+	data  map[string]interface{}
+}
+
+const (
+	colon        = ':'
+	backSlash    = '\\'
+	forwardSlash = '/'
+	singleQuote  = '\''
+	dash         = '-'
+	star         = '*'
+	newLine      = '\n'
+	dollarSign   = '$'
+	doubleQuote  = '"'
+)
 
 // compile a NamedQuery into an unbound query (using the '?' bindvar) and
 // a list of names.
 func compileNamedQuery(qs []byte, bindType int) (query string, names []string, err error) {
-	names = make([]string, 0, 10)
-	rebound := make([]byte, 0, len(qs))
+	var result strings.Builder
+	var params []string
 
-	inName := false
-	last := len(qs) - 1
-	currentVar := 1
-	name := make([]byte, 0, 10)
+	addParam := func(paramName string) {
+		params = append(params, paramName)
 
-	for i, b := range qs {
-		// a ':' while we're in a name is an error
-		if b == ':' {
-			// if this is the second ':' in a '::' escape sequence, append a ':'
-			if inName && i > 0 && qs[i-1] == ':' {
-				rebound = append(rebound, ':')
-				inName = false
-				continue
-			} else if inName {
-				err = errors.New("unexpected `:` while reading named param at " + strconv.Itoa(i))
-				return query, names, err
-			}
-			inName = true
-			name = []byte{}
-		} else if inName && i > 0 && b == '=' && len(name) == 0 {
-			rebound = append(rebound, ':', '=')
-			inName = false
-			continue
-			// if we're in a name, and this is an allowed character, continue
-		} else if inName && (unicode.IsOneOf(allowedBindRunes, rune(b)) || b == '_' || b == '.') && i != last {
-			// append the byte to the name if we are in a name and not on the last byte
-			name = append(name, b)
-			// if we're in a name and it's not an allowed character, the name is done
-		} else if inName {
-			inName = false
-			// if this is the final byte of the string and it is part of the name, then
-			// make sure to add it to the name
-			if i == last && unicode.IsOneOf(allowedBindRunes, rune(b)) {
-				name = append(name, b)
-			}
-			// add the string representation to the names list
-			names = append(names, string(name))
-			// add a proper bindvar for the bindType
-			switch bindType {
-			// oracle only supports named type bind vars even for positional
-			case NAMED:
-				rebound = append(rebound, ':')
-				rebound = append(rebound, name...)
-			case QUESTION, UNKNOWN:
-				rebound = append(rebound, '?')
-			case DOLLAR:
-				rebound = append(rebound, '$')
-				for _, b := range strconv.Itoa(currentVar) {
-					rebound = append(rebound, byte(b))
-				}
-				currentVar++
-			case AT:
-				rebound = append(rebound, '@', 'p')
-				for _, b := range strconv.Itoa(currentVar) {
-					rebound = append(rebound, byte(b))
-				}
-				currentVar++
-			}
-			// add this byte to string unless it was not part of the name
-			if i != last {
-				rebound = append(rebound, b)
-			} else if !unicode.IsOneOf(allowedBindRunes, rune(b)) {
-				rebound = append(rebound, b)
-			}
-		} else {
-			// this is a normal byte and should just go onto the rebound query
-			rebound = append(rebound, b)
+		switch bindType {
+		// oracle only supports named type bind vars even for positional
+		case NAMED:
+			result.WriteByte(':')
+			result.WriteString(paramName)
+		case QUESTION, UNKNOWN:
+			result.WriteByte('?')
+		case DOLLAR:
+			result.WriteByte('$')
+			result.WriteString(strconv.Itoa(len(params)))
+		case AT:
+			result.WriteString("@p")
+			result.WriteString(strconv.Itoa(len(params)))
 		}
 	}
 
-	return string(rebound), names, err
+	isRuneStartOfIdent := func(r rune) bool {
+		return unicode.In(r, unicode.Letter) || r == '_'
+	}
+
+	isRunePartOfIdent := func(r rune) bool {
+		return isRuneStartOfIdent(r) || unicode.In(r, allowedBindRunes...) || r == '_' || r == '.'
+	}
+
+	ctx := parseNamedContext{state: parseStateQuery}
+
+	setState := func(s parseNamedState, d map[string]interface{}) {
+		ctx.data = d
+		ctx.state = s
+	}
+
+	var previousRune rune
+	maxIndex := len(qs)
+
+	for byteIndex := 0; byteIndex < maxIndex; {
+		currentRune, runeWidth := utf8.DecodeRune(qs[byteIndex:])
+		nextRuneByteIndex := byteIndex + runeWidth
+
+		nextRune := utf8.RuneError
+		if nextRuneByteIndex < maxIndex {
+			nextRune, _ = utf8.DecodeRune(qs[nextRuneByteIndex:])
+		}
+
+		writeCurrentRune := true
+		switch ctx.state {
+		case parseStateQuery:
+			if currentRune == colon && previousRune != colon && isRuneStartOfIdent(nextRune) {
+				// :foo
+				writeCurrentRune = false
+				setState(parseStateConsumingIdent, map[string]interface{}{
+					"ident": &strings.Builder{},
+				})
+			} else if currentRune == singleQuote && previousRune != backSlash {
+				// \'
+				setState(parseStateStringConstant, nil)
+			} else if currentRune == dash && nextRune == dash {
+				// -- single line comment
+				setState(parseStateLineComment, nil)
+			} else if currentRune == forwardSlash && nextRune == star {
+				// /*
+				setState(parseStateSkipThenTransition, map[string]interface{}{
+					"state": parseStateBlockComment,
+					"data": map[string]interface{}{
+						"depth": 1,
+					},
+				})
+			} else if currentRune == dollarSign && previousRune == dollarSign {
+				// $$
+				setState(parseStateDollarQuoteLiteral, nil)
+			} else if currentRune == doubleQuote {
+				// "foo"."bar"
+				setState(parseStateQuotedIdent, nil)
+			}
+		case parseStateConsumingIdent:
+			if isRunePartOfIdent(currentRune) {
+				ctx.data["ident"].(*strings.Builder).WriteRune(currentRune)
+				writeCurrentRune = false
+			} else {
+				addParam(ctx.data["ident"].(*strings.Builder).String())
+				setState(parseStateQuery, nil)
+			}
+		case parseStateBlockComment:
+			if previousRune == star && currentRune == forwardSlash {
+				newDepth := ctx.data["depth"].(int) - 1
+				if newDepth == 0 {
+					setState(parseStateQuery, nil)
+				} else {
+					ctx.data["depth"] = newDepth
+				}
+			}
+		case parseStateLineComment:
+			if currentRune == newLine {
+				setState(parseStateQuery, nil)
+			}
+		case parseStateStringConstant:
+			if currentRune == singleQuote && previousRune != backSlash {
+				setState(parseStateQuery, nil)
+			}
+		case parseStateDollarQuoteLiteral:
+			if currentRune == dollarSign && previousRune != dollarSign {
+				setState(parseStateQuery, nil)
+			}
+		case parseStateQuotedIdent:
+			if currentRune == doubleQuote {
+				setState(parseStateQuery, nil)
+			}
+		case parseStateSkipThenTransition:
+			setState(ctx.data["state"].(parseNamedState), ctx.data["data"].(map[string]interface{}))
+		default:
+			setState(parseStateQuery, nil)
+		}
+
+		if writeCurrentRune {
+			result.WriteRune(currentRune)
+		}
+
+		previousRune = currentRune
+		byteIndex = nextRuneByteIndex
+	}
+
+	// If parsing left off while consuming an ident, add that ident to params
+	if ctx.state == parseStateConsumingIdent {
+		addParam(ctx.data["ident"].(*strings.Builder).String())
+	}
+
+	return result.String(), params, nil
 }
 
 // BindNamed binds a struct or a map to a query with named parameters.

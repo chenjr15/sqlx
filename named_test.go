@@ -30,7 +30,7 @@ func TestCompileQuery(t *testing.T) {
 			V: []string{"name1", "name2"},
 		},
 		{
-			Q: `SELECT "::foo" FROM a WHERE first_name=:name1 AND last_name=:name2`,
+			Q: `SELECT ":foo" FROM a WHERE first_name=:name1 AND last_name=:name2`,
 			R: `SELECT ":foo" FROM a WHERE first_name=? AND last_name=?`,
 			D: `SELECT ":foo" FROM a WHERE first_name=$1 AND last_name=$2`,
 			T: `SELECT ":foo" FROM a WHERE first_name=@p1 AND last_name=@p2`,
@@ -38,11 +38,11 @@ func TestCompileQuery(t *testing.T) {
 			V: []string{"name1", "name2"},
 		},
 		{
-			Q: `SELECT 'a::b::c' || first_name, '::::ABC::_::' FROM person WHERE first_name=:first_name AND last_name=:last_name`,
-			R: `SELECT 'a:b:c' || first_name, '::ABC:_:' FROM person WHERE first_name=? AND last_name=?`,
-			D: `SELECT 'a:b:c' || first_name, '::ABC:_:' FROM person WHERE first_name=$1 AND last_name=$2`,
-			T: `SELECT 'a:b:c' || first_name, '::ABC:_:' FROM person WHERE first_name=@p1 AND last_name=@p2`,
-			N: `SELECT 'a:b:c' || first_name, '::ABC:_:' FROM person WHERE first_name=:first_name AND last_name=:last_name`,
+			Q: `SELECT 'a:b:c' || first_name, ':ABC:_:' FROM person WHERE first_name=:first_name AND last_name=:last_name`,
+			R: `SELECT 'a:b:c' || first_name, ':ABC:_:' FROM person WHERE first_name=? AND last_name=?`,
+			D: `SELECT 'a:b:c' || first_name, ':ABC:_:' FROM person WHERE first_name=$1 AND last_name=$2`,
+			T: `SELECT 'a:b:c' || first_name, ':ABC:_:' FROM person WHERE first_name=@p1 AND last_name=@p2`,
+			N: `SELECT 'a:b:c' || first_name, ':ABC:_:' FROM person WHERE first_name=:first_name AND last_name=:last_name`,
 			V: []string{"first_name", "last_name"},
 		},
 		{
@@ -53,16 +53,39 @@ func TestCompileQuery(t *testing.T) {
 			T: `SELECT @name := "name", @p1, @p2, @p3`,
 			V: []string{"age", "first", "last"},
 		},
-		/* This unicode awareness test sadly fails, because of our byte-wise worldview.
-		 * We could certainly iterate by Rune instead, though it's a great deal slower,
-		 * it's probably the RightWay(tm)
 		{
 			Q: `INSERT INTO foo (a,b,c,d) VALUES (:あ, :b, :キコ, :名前)`,
 			R: `INSERT INTO foo (a,b,c,d) VALUES (?, ?, ?, ?)`,
 			D: `INSERT INTO foo (a,b,c,d) VALUES ($1, $2, $3, $4)`,
-			N: []string{"name", "age", "first", "last"},
+			N: `INSERT INTO foo (a,b,c,d) VALUES (:あ, :b, :キコ, :名前)`,
+			T: `INSERT INTO foo (a,b,c,d) VALUES (@p1, @p2, @p3, @p4)`,
+			V: []string{"あ", "b", "キコ", "名前"},
 		},
-		*/
+		{
+			Q: "-- A Line Comment should be ignored for :params\nINSERT INTO foo (a,b,c,d) VALUES (:あ, :b, :キコ, :名前)",
+			R: "-- A Line Comment should be ignored for :params\nINSERT INTO foo (a,b,c,d) VALUES (?, ?, ?, ?)",
+			D: "-- A Line Comment should be ignored for :params\nINSERT INTO foo (a,b,c,d) VALUES ($1, $2, $3, $4)",
+			N: "-- A Line Comment should be ignored for :params\nINSERT INTO foo (a,b,c,d) VALUES (:あ, :b, :キコ, :名前)",
+			T: "-- A Line Comment should be ignored for :params\nINSERT INTO foo (a,b,c,d) VALUES (@p1, @p2, @p3, @p4)",
+			V: []string{"あ", "b", "キコ", "名前"},
+		},
+		{
+			Q: `/* A Block Comment should be ignored for :params */INSERT INTO foo (a,b,c,d) VALUES (:あ, :b, :キコ, :名前)`,
+			R: `/* A Block Comment should be ignored for :params */INSERT INTO foo (a,b,c,d) VALUES (?, ?, ?, ?)`,
+			D: `/* A Block Comment should be ignored for :params */INSERT INTO foo (a,b,c,d) VALUES ($1, $2, $3, $4)`,
+			N: `/* A Block Comment should be ignored for :params */INSERT INTO foo (a,b,c,d) VALUES (:あ, :b, :キコ, :名前)`,
+			T: `/* A Block Comment should be ignored for :params */INSERT INTO foo (a,b,c,d) VALUES (@p1, @p2, @p3, @p4)`,
+			V: []string{"あ", "b", "キコ", "名前"},
+		},
+		// Repeated names are not distinct in the names list
+		{
+			Q: `INSERT INTO foo (a,b,c,d) VALUES (:name, :age, :name)`,
+			R: `INSERT INTO foo (a,b,c,d) VALUES (?, ?, ?)`,
+			D: `INSERT INTO foo (a,b,c,d) VALUES ($1, $2, $3)`,
+			T: `INSERT INTO foo (a,b,c,d) VALUES (@p1, @p2, @p3)`,
+			N: `INSERT INTO foo (a,b,c,d) VALUES (:name, :age, :name)`,
+			V: []string{"name", "age", "name"},
+		},
 	}
 
 	for _, test := range table {
@@ -95,6 +118,48 @@ func TestCompileQuery(t *testing.T) {
 		qq, _, _ := compileNamedQuery([]byte(test.Q), NAMED)
 		if qq != test.N {
 			t.Errorf("\nexpected: `%s`\ngot:      `%s`\n(len: %d vs %d)", test.N, qq, len(test.N), len(qq))
+		}
+	}
+}
+
+func TestNamedQueryWithoutParams(t *testing.T) {
+	var queries []string = []string{
+		// Array Slice Syntax
+		`SELECT schedule[1:2][1:1] FROM sal_emp WHERE name = 'Bill';`,
+		`SELECT f1[1][-2][3] AS e1, f1[1][-1][5] AS e2 FROM (SELECT '[1:1][-2:-1][3:5]={{{1,2,3},{4,5,6}}}'::int[] AS f1) AS ss;`,
+		`SELECT array_dims(1 || '[0:1]={2,3}'::int[]);`,
+		// String Constant Syntax
+		`'Dianne'':not_a_parameter horse'`,
+		`'Dianne'''':not_a_parameter horse'`,
+		`SELECT ':not_an_parameter'`,
+		`$$Dia:not_an_parameter's horse$$`,
+		`$$Dianne's horse$$`,
+		`SELECT 'foo'
+			'bar';`,
+		`E'user\'s log'`,
+		`$$escape ' with ''$$`,
+		// Quoted Ident Syntax
+		`SELECT "addr:city" FROM "location";`,
+		// Type Cast Syntax
+		`select '1'   ::   numeric;`, `select '1'   ::  text :: numeric;`,
+		// Nested Block Quotes
+		`SELECT * FROM users
+		/* Ignore all things who aren't after a certain :date
+		 * More lines /* nested block comment
+		 */*/
+		WHERE some_text LIKE 'foo -- bar'`,
+	}
+
+	for _, q := range queries {
+		qr, names, err := compileNamedQuery([]byte(q), QUESTION)
+		if err != nil {
+			t.Error(err)
+		}
+		if qr != q {
+			t.Errorf("expected query to be unaltered\nexpected: %s\ngot:%s", q, qr)
+		}
+		if len(names) > 0 {
+			t.Errorf("expected params to be empty got: %v", names)
 		}
 	}
 }
@@ -156,7 +221,7 @@ func TestNamedQueries(t *testing.T) {
 		test.Error(err)
 
 		ns, err = db.PrepareNamed(`
-			SELECT first_name, last_name, email 
+			SELECT first_name, last_name, email
 			FROM person WHERE first_name=:first_name AND email=:email`)
 		test.Error(err)
 
